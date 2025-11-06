@@ -8,29 +8,69 @@ function getPlainText(html: string): string {
     return tempDiv.textContent || tempDiv.innerText || '';
 }
 
+// Helper to add delay between API calls to avoid rate limiting
+function delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Helper to retry API calls with exponential backoff
+async function retryWithBackoff<T>(
+    fn: () => Promise<T>,
+    maxRetries: number = 5,
+    initialDelay: number = 1000
+): Promise<T> {
+    let lastError: any;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (error: any) {
+            lastError = error;
+
+            // Check if it's a rate limit error
+            const isRateLimitError =
+                error?.message?.toLowerCase().includes('rate limit') ||
+                error?.message?.toLowerCase().includes('quota') ||
+                error?.message?.toLowerCase().includes('429') ||
+                error?.status === 429;
+
+            if (!isRateLimitError || attempt === maxRetries - 1) {
+                throw error; // Not a rate limit error or last attempt
+            }
+
+            // Calculate exponential backoff delay
+            const backoffDelay = initialDelay * Math.pow(2, attempt);
+            console.log(`Rate limit hit. Retrying in ${backoffDelay}ms (attempt ${attempt + 1}/${maxRetries})...`);
+            await delay(backoffDelay);
+        }
+    }
+    throw lastError;
+}
+
 // 1. Task Analyzer ("Pre-judger")
 export async function analyzeTask(assignmentHtml: string): Promise<boolean> {
     const { GoogleGenAI } = await import("@google/genai");
     const API_KEY = process.env.API_KEY;
     if (!API_KEY) throw new Error("API_KEY not set.");
-    
+
     const ai = new GoogleGenAI({ apiKey: API_KEY });
 
     const assignmentText = getPlainText(assignmentHtml).substring(0, 4000); // Limit context for speed/cost
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `Does the following assignment text explicitly require the inclusion of images, pictures, photos, or visuals? Answer only with a JSON object: {"requires_images": boolean}.\n\nText: "${assignmentText}"`,
-        config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                    requires_images: { type: Type.BOOLEAN },
+    const response = await retryWithBackoff(async () => {
+        return await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: `Does the following assignment text explicitly require the inclusion of images, pictures, photos, or visuals? Answer only with a JSON object: {"requires_images": boolean}.\n\nText: "${assignmentText}"`,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        requires_images: { type: Type.BOOLEAN },
+                    },
+                    required: ['requires_images']
                 },
-                required: ['requires_images']
             },
-        },
+        });
     });
 
     try {
@@ -79,11 +119,13 @@ Attached is the visual screenshot of the assignment. Use it to understand the la
     const textPart = { text: prompt };
 
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-pro',
-            contents: { parts: [textPart, imagePart] },
+        const response = await retryWithBackoff(async () => {
+            return await ai.models.generateContent({
+                model: 'gemini-2.5-pro',
+                contents: { parts: [textPart, imagePart] },
+            });
         });
-        
+
         const text = response.text.trim();
         return text.replace(/^```html\s*|```\s*$/g, '').trim();
     } catch (error) {
@@ -113,29 +155,31 @@ export async function completeAssignmentWithImages(
 
     // Step A: Identify image requirements
     onProgress('Identifying image needs...', 15);
-    const getPromptsResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `Based on the following assignment text, identify all distinct concepts that require a visual representation. For each concept, create a concise, descriptive prompt suitable for an AI image generation model to create a simple, clear, and representative image or icon. Return your answer ONLY as a JSON object with a single key 'image_requests', which is an array of objects, each with 'term' and 'prompt' keys. e.g., [{"term": "Birth Rate", "prompt": "A simple icon representing a high birth rate..."}].\n\nText: "${getPlainText(assignmentHtml)}"`,
-        config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                    image_requests: {
-                        type: Type.ARRAY,
-                        items: {
-                            type: Type.OBJECT,
-                            properties: {
-                                term: { type: Type.STRING },
-                                prompt: { type: Type.STRING }
-                            },
-                            required: ['term', 'prompt']
+    const getPromptsResponse = await retryWithBackoff(async () => {
+        return await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: `Based on the following assignment text, identify all distinct concepts that require a visual representation. For each concept, create a concise, descriptive prompt suitable for an AI image generation model to create a simple, clear, and representative image or icon. Return your answer ONLY as a JSON object with a single key 'image_requests', which is an array of objects, each with 'term' and 'prompt' keys. e.g., [{"term": "Birth Rate", "prompt": "A simple icon representing a high birth rate..."}].\n\nText: "${getPlainText(assignmentHtml)}"`,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        image_requests: {
+                            type: Type.ARRAY,
+                            items: {
+                                type: Type.OBJECT,
+                                properties: {
+                                    term: { type: Type.STRING },
+                                    prompt: { type: Type.STRING }
+                                },
+                                required: ['term', 'prompt']
+                            }
                         }
-                    }
+                    },
+                    required: ['image_requests']
                 },
-                required: ['image_requests']
-            },
-        }
+            }
+        });
     });
     
     const { image_requests: imageRequests } = JSON.parse(getPromptsResponse.text) as { image_requests: ImageRequest[] };
@@ -152,18 +196,29 @@ export async function completeAssignmentWithImages(
         const req = imageRequests[i];
         const progress = 20 + Math.round((70 / totalImages) * (i + 1));
         onProgress(`Generating image ${i + 1}/${totalImages}: ${req.term}`, progress);
-        
-        const imageResponse = await ai.models.generateImages({
-            model: 'imagen-4.0-generate-001',
-            prompt: req.prompt,
-            config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio: '1:1' }
+
+        const imageResponse = await retryWithBackoff(async () => {
+            return await ai.models.generateImages({
+                model: 'imagen-4.0-generate-001',
+                prompt: req.prompt,
+                config: { numberOfImages: 1, outputMimeType: 'image/png', aspectRatio: '1:1' }
+            });
         });
 
         const image = imageResponse.generatedImages[0]?.image?.imageBytes;
         if (image) {
             generatedImages.push({ term: req.term, imageBase64: image });
         }
+
+        // Add a small delay between image generations to avoid rate limiting
+        if (i < totalImages - 1) {
+            await delay(500); // 500ms delay between images
+        }
     }
+
+    // Add a longer delay before the final composition to let rate limits reset
+    onProgress('Preparing final document...', 92);
+    await delay(2000); // 2 second delay before Step C
 
     // Step C: Compose final document
     onProgress('Composing final document...', 95);
@@ -192,14 +247,16 @@ ${JSON.stringify(generatedImages)}
 ---
 
 Attached is the visual screenshot of the original assignment. Now, provide the final, completed HTML with text answers and embedded images.`;
-    
-    const finalResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-pro',
-        contents: { parts: [
-            { text: finalPrompt },
-            { inlineData: { mimeType: 'image/png', data: imageBase64 } }
-        ]},
-    });
+
+    const finalResponse = await retryWithBackoff(async () => {
+        return await ai.models.generateContent({
+            model: 'gemini-2.5-pro',
+            contents: { parts: [
+                { text: finalPrompt },
+                { inlineData: { mimeType: 'image/png', data: imageBase64 } }
+            ]},
+        });
+    }, 5, 2000); // Longer initial delay (2s) for the final heavy request
 
     const finalText = finalResponse.text.trim();
     return finalText.replace(/^```html\s*|```\s*$/g, '').trim();
