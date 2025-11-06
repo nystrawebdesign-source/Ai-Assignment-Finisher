@@ -1,0 +1,5 @@
+{
+  "name": "AI Assignment Finisher",
+  "description": "An AI-powered tool to help complete assignments. Paste your document from a rich text editor, provide any relevant notes or materials, and let the AI generate the completed version, ready to be copied back with formatting intact.",
+  "requestFramePermissions": []
+}
